@@ -130,3 +130,112 @@ def mcp_als(X, rank, mask, random_state=None, init='randn', skip_modes=[], **opt
 
     # Finalize and return the optimization result.
     return result.finalize()
+
+
+###############
+#### FINCH ####
+###############
+
+
+def _get_available_idx(ndim: int, matricized_idx: int, reverse: bool) -> int:
+    indices = reversed(range(ndim)) if reverse else range(ndim)
+    for idx in indices:
+        if idx == matricized_idx:
+            continue
+        return idx
+
+
+def _get_component_slice(ndim: int, matricized_idx: int, reverse: bool) -> tuple:
+    av_idx = _get_available_idx(ndim, matricized_idx, reverse)
+    cs = [None for _ in range(ndim)]
+    cs[av_idx] = slice(None)
+    return tuple(cs)
+
+
+import sparse
+xp = sparse
+
+
+@sparse.compiled()
+def lhs_stack_kernel(mask, component1, component2, n, ndim):
+    krt = xp.permute_dims(component1[None, :, :] * component2[:, None, :], (2, 1, 0))
+    krt2 = xp.permute_dims(krt, (1, 2, 0))
+    moveax = (n, *[i for i in range(ndim) if i != n])
+    new_mask = xp.permute_dims(mask, moveax)
+    return xp.sum(
+        new_mask[:, None, :, :, None] * krt[None, :, :, :, None] * krt2[None, None, :, :, :],
+        axis=(2, 3)
+    )
+
+
+@sparse.compiled()
+def rhs_stack_kernel(X, component1, component2, n):
+    ndim = X.ndim
+    axis = tuple(i for i in range(ndim) if i != n)
+    return xp.sum(
+        (
+            X[:, :, :, None] *
+            component1[_get_component_slice(ndim, n, reverse=False) + (slice(None),)] *
+            component2[_get_component_slice(ndim, n, reverse=True) + (slice(None),)]
+        ),
+        axis=axis,
+    )
+
+
+def mcp_als_sparse(
+    X,
+    X_sp,
+    rank,
+    mask,
+    mask_sp,
+    random_state=None,
+    init='randn',
+    skip_modes=[],
+    **options,
+):
+    # Check inputs.
+    optim_utils._check_cpd_inputs(X, rank)
+
+    # Initialize problem.
+    U, _ = optim_utils._get_initial_ktensor(init, X, rank, random_state, scale_norm=False)
+    result = FitResult(U, 'MCP_ALS', **options)
+    normX = np.linalg.norm((X * mask))
+
+    # Main optimization loop.
+    while result.still_optimizing:
+
+        # Iterate over each tensor mode.
+        for n in range(X.ndim):
+
+            # Skip modes that are specified as fixed.
+            if n in skip_modes:
+                continue
+
+            # i) Normalize factors to prevent singularities.
+            U.rebalance()
+
+            # ii) Form Khatri-Rao product of factors matrices.
+            # iii) Broadcasted solve of linear systems.
+            components = [U[j] for j in range(X.ndim) if j != n]
+            components_sp = [sparse.asarray(c, format="dense") for c in components]
+
+            lhs_stack_shadow = lhs_stack_kernel(mask_sp, components_sp[0], components_sp[1], n, X.ndim).todense()
+            # TODO: bug in lazy mode
+            if n == 2:
+                lhs_stack_shadow = np.moveaxis(lhs_stack_shadow, 1, 0)
+
+            rhs_stack_shadow = rhs_stack_kernel(X_sp, components_sp[0], components_sp[1], n)[:, :, None].todense()
+
+            # iv) Update factor.
+            U[n] = np.linalg.solve(lhs_stack_shadow, rhs_stack_shadow).reshape(X.shape[n], rank)
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Update the optimization result, checks for convergence.
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        obj = linalg.norm(mask * (U.full() - X)) / normX
+
+        # Update result
+        result.update(obj)
+
+    # Finalize and return the optimization result.
+    return result.finalize()
